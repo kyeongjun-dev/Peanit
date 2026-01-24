@@ -128,7 +128,7 @@ def check_existing_branch(ticket_key):
                             ticket = Ticket.query.filter_by(key=ticket_key).first()
                             if ticket:
                                 ticket.branch_url = f"{repo_html_url}/tree/{branch['name']}"
-                                if ticket.status == "To Do": ticket.status = "In Progress"
+                                # if ticket.status == "To Do": ticket.status = "In Progress"
                                 db.session.commit()
                                 print(f"🔗 [자동 연결 완료] {repo_full_name} -> {branch['name']}")
                                 notify_frontend(ticket.key, ticket.status)
@@ -215,7 +215,7 @@ def handle_branch_creation(payload):
         with app.app_context():
             ticket = Ticket.query.filter_by(key=ticket_key).first()
             if ticket:
-                ticket.status = "In Progress"
+                # ticket.status = "In Progress"
                 ticket.branch_url = f"{repo_html_url}/tree/{branch_name}"
                 db.session.commit()
                 notify_frontend(ticket_key, "In Progress")
