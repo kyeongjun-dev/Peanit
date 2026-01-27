@@ -11,6 +11,7 @@ from flask import Flask, request, jsonify, abort, Response, stream_with_context
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from dotenv import load_dotenv
+import threading
 
 # --- 1. 설정 및 환경변수 로드 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,6 +53,7 @@ class Ticket(db.Model):
     title = db.Column(db.String(200), nullable=False)
     content = db.Column(db.Text, default="")
     status = db.Column(db.String(20), default="To Do")
+    order_index = db.Column(db.Integer, default=0)
     branch_url = db.Column(db.String(200))
     pr_url = db.Column(db.String(200))
 
@@ -61,6 +63,7 @@ class Ticket(db.Model):
             "title": self.title,
             "content": self.content,
             "status": self.status,
+            "order_index": self.order_index, # ✨
             "branch_url": self.branch_url,
             "pr_url": self.pr_url
         }
@@ -139,25 +142,29 @@ def check_existing_branch(ticket_key):
 # --- 5. API 엔드포인트 ---
 @app.route('/api/tickets', methods=['GET'])
 def get_tickets():
-    tickets = Ticket.query.order_by(Ticket.id.desc()).all()
+    # order_index 오름차순 (0, 1, 2...)
+    tickets = Ticket.query.order_by(Ticket.order_index.asc()).all()
     return jsonify([t.to_dict() for t in tickets])
 
 @app.route('/api/tickets', methods=['POST'])
 def create_ticket():
     data = request.json
-    last_ticket = Ticket.query.order_by(Ticket.id.desc()).first()
-    next_id = 1 if not last_ticket else last_ticket.id + 1
+    last_ticket_id = Ticket.query.order_by(Ticket.id.desc()).first()
+    next_id = 1 if not last_ticket_id else last_ticket_id.id + 1
     ticket_key = f"MY-{next_id}" 
 
-    new_ticket = Ticket(key=ticket_key, title=data['title'])
+    # ✨ 새 티켓은 맨 아래(가장 큰 index + 1)에 추가
+    max_order = db.session.query(db.func.max(Ticket.order_index)).scalar() or 0
+
+    new_ticket = Ticket(key=ticket_key, title=data['title'], order_index=max_order + 1)
     db.session.add(new_ticket)
     db.session.commit()
     
-    print(f"📢 새 티켓 생성됨: {ticket_key}")
     notify_frontend(new_ticket.key, new_ticket.status)
 
-    # ⛔️ [동기 방식] 여기서 검색이 끝날 때까지 사용자는 기다려야 함
-    check_existing_branch(ticket_key)
+    # 비동기 브랜치 검색
+    thread = threading.Thread(target=check_existing_branch, args=(ticket_key,))
+    thread.start()
     
     return jsonify(new_ticket.to_dict()), 201
 
@@ -174,6 +181,33 @@ def update_ticket(key):
     db.session.commit()
     notify_frontend(ticket.key, ticket.status)
     return jsonify(ticket.to_dict())
+
+# 3. ✨ [신규] 배치 업데이트 API (순서 변경용)
+@app.route('/api/tickets/batch', methods=['PUT'])
+def update_tickets_batch():
+    """
+    프론트엔드에서 보낸 티켓 리스트(순서 포함)대로 DB를 싹 업데이트합니다.
+    """
+    tickets_data = request.json # [{key: 'MY-1', status: 'To Do', order_index: 0}, ...]
+
+    changed_ticket_key = None # 알림용 (하나만 보냄)
+
+    for item in tickets_data:
+        ticket = Ticket.query.filter_by(key=item['key']).first()
+        if ticket:
+            # 상태나 순서가 바뀌었으면 업데이트
+            if ticket.status != item['status'] or ticket.order_index != item['order_index']:
+                ticket.status = item['status']
+                ticket.order_index = item['order_index']
+                changed_ticket_key = ticket.key # 변경된 놈 기억
+
+    db.session.commit()
+
+    # 변경 사항이 있으면 방송 (단순하게 '목록 갱신해라' 신호만 줘도 됨)
+    if changed_ticket_key:
+        notify_frontend(changed_ticket_key, "Batch Updated")
+
+    return jsonify({"message": "Batch update success"})
 
 @app.route('/stream')
 def stream():
