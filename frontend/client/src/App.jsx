@@ -121,6 +121,21 @@ function App() {
     } catch (err) { alert("저장 실패"); }
   };
 
+  // ✨ [신규] 티켓 삭제 함수 추가
+  const deleteTicket = async () => {
+    if (!selectedTicket) return;
+    if (!window.confirm("정말 이 티켓을 삭제하시겠습니까?")) return;
+
+    try {
+      await axios.delete(`http://localhost:3000/api/tickets/${selectedTicket.key}`);
+      fetchTickets(activeProjectId); // 목록 갱신
+      setSelectedTicket(null); // 모달 닫기
+    } catch (err) {
+      alert("삭제 실패");
+      console.error(err);
+    }
+  };
+
   const copyBranchCommand = () => {
     if (!selectedTicket) return;
     const command = `git checkout -b feature/${selectedTicket.key}`;
@@ -335,29 +350,52 @@ function App() {
         </div>
       )}
 
+      {/* ✨ [수정] 티켓 상세 모달 */}
       {selectedTicket && (
           <div style={{ position: "fixed", top: 0, left: 0, width: "100%", height: "100%", backgroundColor: "rgba(0,0,0,0.5)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 1000 }} onClick={() => setSelectedTicket(null)}>
             <div style={{ background: "white", width: "600px", padding: "30px", borderRadius: "8px" }} onClick={(e) => e.stopPropagation()}>
-                <div style={{display:"flex", alignItems:"center", gap:"10px", marginBottom:"20px"}}>
-                     <div style={{fontSize:"18px", fontWeight:"bold"}}>{selectedTicket.key}</div>
-                     <span style={{fontSize:"12px", background:"#dfe1e6", padding:"2px 6px", borderRadius:"4px"}}>{selectedTicket.status}</span>
+                
+                {/* ✨ 상단: 키값과 닫기(X) 버튼 */}
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:"20px", borderBottom:"1px solid #eee", paddingBottom:"10px" }}>
+                     <div style={{flex: 1}}>
+                         <div style={{display:"flex", alignItems:"center", gap:"10px", marginBottom:"5px"}}>
+                            <span style={{fontSize:"14px", fontWeight:"bold", color:"#5e6c84"}}>{selectedTicket.key}</span>
+                            <span style={{fontSize:"12px", background:"#dfe1e6", padding:"2px 6px", borderRadius:"4px", color:"#172b4d"}}>{selectedTicket.status}</span>
+                         </div>
+                         <input type="text" value={selectedTicket.title} onChange={(e) => setSelectedTicket({...selectedTicket, title: e.target.value})} style={{ width: "100%", fontSize: "24px", fontWeight: "bold", border:"none", outline:"none" }} />
+                     </div>
+                     <button onClick={() => setSelectedTicket(null)} style={{ background: "transparent", border: "none", fontSize: "24px", cursor: "pointer", color: "#6b778c", lineHeight: "1" }}>×</button>
                 </div>
                 
-                <input type="text" value={selectedTicket.title} onChange={(e) => setSelectedTicket({...selectedTicket, title: e.target.value})} style={{ width: "100%", fontSize: "20px", marginBottom:"20px", padding:"5px" }} />
-                <textarea value={selectedTicket.content || ""} onChange={(e) => setSelectedTicket({...selectedTicket, content: e.target.value})} style={{ width: "100%", height: "150px", marginBottom:"20px", padding:"10px" }} />
+                <div style={{marginBottom:"20px"}}>
+                    <h4 style={{fontSize:"12px", color:"#5e6c84", margin:"0 0 5px 0", textTransform:"uppercase"}}>Description</h4>
+                    <textarea value={selectedTicket.content || ""} onChange={(e) => setSelectedTicket({...selectedTicket, content: e.target.value})} style={{ width: "100%", height: "150px", padding: "10px", borderRadius:"4px", border:"1px solid #dfe1e6", resize:"none", fontFamily:"inherit" }} placeholder="내용을 입력하세요..." />
+                </div>
                 
-                {selectedTicket.branch_url ? (
-                     <a href={selectedTicket.branch_url} target="_blank" rel="noreferrer" style={{display:"block", marginBottom:"20px", color:"green"}}>🌱 브랜치 바로가기</a>
-                ) : (
-                    <div style={{background:"#f4f5f7", padding:"10px", marginBottom:"20px", borderRadius:"4px"}}>
-                        <code>git checkout -b feature/{selectedTicket.key}</code>
-                        <button onClick={copyBranchCommand} style={{marginLeft:"10px"}}>복사</button>
-                        {isCopied && <span style={{marginLeft:"5px", color:"green"}}>V</span>}
-                    </div>
-                )}
+                <div style={{marginBottom:"30px"}}>
+                    <h4 style={{fontSize:"12px", color:"#5e6c84", margin:"0 0 5px 0", textTransform:"uppercase"}}>Branch</h4>
+                    {selectedTicket.branch_url ? (
+                        <a href={selectedTicket.branch_url} target="_blank" rel="noreferrer" style={{display:"flex", alignItems:"center", gap:"5px", color:"#0052cc", textDecoration:"none", fontWeight:"bold"}}>
+                            🌱 브랜치 바로가기 <span style={{fontSize:"12px"}}>↗</span>
+                        </a>
+                    ) : (
+                        <div style={{background:"#f4f5f7", padding:"10px", borderRadius:"4px", display:"flex", alignItems:"center", justifyContent:"space-between"}}>
+                            <code style={{fontFamily:"monospace", color:"#d63384"}}>git checkout -b feature/{selectedTicket.key}</code>
+                            <div style={{display:"flex", alignItems:"center", gap:"5px"}}>
+                                {isCopied && <span style={{fontSize:"12px", color:"green", fontWeight:"bold"}}>Copied!</span>}
+                                <button onClick={copyBranchCommand} style={{background:"#ebecf0", border:"none", padding:"4px 8px", borderRadius:"3px", cursor:"pointer", fontSize:"12px", color:"#42526e"}}>복사</button>
+                            </div>
+                        </div>
+                    )}
+                </div>
 
-                <div style={{textAlign:"right"}}>
-                    <button onClick={saveTicket} style={{ padding: "8px 20px", background: "#0052cc", color: "white", border: "none", borderRadius: "4px" }}>저장</button>
+                {/* ✨ 하단 버튼 영역: 삭제 / 닫기 / 저장 */}
+                <div style={{ display: "flex", justifyContent: "space-between", paddingTop: "20px", borderTop: "1px solid #eee" }}>
+                    <button onClick={deleteTicket} style={{ padding: "8px 16px", background: "#ffebe6", color: "#de350b", border: "none", borderRadius: "4px", cursor: "pointer", fontWeight: "bold" }}>🗑️ 삭제</button>
+                    <div style={{display:"flex", gap:"10px"}}>
+                        <button onClick={() => setSelectedTicket(null)} style={{ padding: "8px 16px", background: "none", border: "none", cursor: "pointer", color: "#42526e" }}>닫기</button>
+                        <button onClick={saveTicket} style={{ padding: "8px 20px", background: "#0052cc", color: "white", border: "none", borderRadius: "4px", cursor: "pointer", fontWeight: "bold" }}>저장하기</button>
+                    </div>
                 </div>
             </div>
           </div>
