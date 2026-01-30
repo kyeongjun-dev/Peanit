@@ -7,11 +7,12 @@ import time
 import jwt
 import requests
 import queue
+import threading
 from flask import Flask, request, jsonify, abort, Response, stream_with_context
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
 from flask_cors import CORS
 from dotenv import load_dotenv
-import threading
 
 # --- 1. 설정 및 환경변수 로드 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -46,11 +47,15 @@ class MessageAnnouncer:
 
 announcer = MessageAnnouncer()
 
-# --- 2. DB 모델 수정 ---
+# --- 2. DB 모델 ---
 class Project(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)   # 프로젝트 이름 (예: "쇼핑몰 구축")
-    code = db.Column(db.String(10), unique=True, nullable=False) # 프로젝트 코드 (예: "SHOP")
+    name = db.Column(db.String(100), nullable=False)
+    code = db.Column(db.String(10), unique=True, nullable=False)
+    
+    # ✨ [신규] 마지막으로 발급된 티켓 번호를 프로젝트가 기억합니다.
+    last_ticket_number = db.Column(db.Integer, default=0)
+    
     tickets = db.relationship('Ticket', backref='project', lazy=True)
 
     def to_dict(self):
@@ -58,14 +63,18 @@ class Project(db.Model):
 
 class Ticket(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    project_id = db.Column(db.Integer, db.ForeignKey('project.id'), nullable=False) # ✨ 소속 프로젝트 ID
+    project_id = db.Column(db.Integer, db.ForeignKey('project.id'), nullable=False)
     key = db.Column(db.String(20), unique=True, nullable=False)
+    ticket_number = db.Column(db.Integer, nullable=False)
+    
     title = db.Column(db.String(200), nullable=False)
     content = db.Column(db.Text, default="")
     status = db.Column(db.String(20), default="To Do")
     order_index = db.Column(db.Integer, default=0)
+    
     branch_url = db.Column(db.String(200))
     pr_url = db.Column(db.String(200))
+    is_merged = db.Column(db.Boolean, default=False)
 
     def to_dict(self):
         return {
@@ -76,7 +85,8 @@ class Ticket(db.Model):
             "order_index": self.order_index,
             "branch_url": self.branch_url,
             "pr_url": self.pr_url,
-            "project_code": self.project.code # 프론트에서 색상 구분등에 쓸 수 있음
+            "is_merged": self.is_merged,
+            "project_code": self.project.code
         }
 
 with app.app_context():
@@ -89,13 +99,15 @@ def format_sse(data: str, event=None):
         msg = f'event: {event}\n{msg}'
     return msg.encode('utf-8')
 
-def notify_frontend(ticket_key, status):
-    data = json.dumps({'key': ticket_key, 'status': status})
-    msg = format_sse(data, event="ticket_updated")
+def notify_frontend(data, event_type="ticket_updated"):
+    if isinstance(data, dict):
+        msg_body = json.dumps(data)
+    else:
+        msg_body = json.dumps({'key': data, 'action': 'reload'})
+    msg = format_sse(msg_body, event=event_type)
     announcer.announce(msg)
-    print(f"📡 [SSE 방송] {ticket_key} 상태 변경 알림 전송")
 
-# --- 4. GitHub API 유틸리티 (전체 스캔) ---
+# --- 4. GitHub API 유틸리티 ---
 def get_github_token():
     payload = {'iat': int(time.time()), 'exp': int(time.time()) + (10 * 60), 'iss': GITHUB_APP_ID}
     encoded_jwt = jwt.encode(payload, GITHUB_PRIVATE_KEY, algorithm='RS256')
@@ -111,16 +123,20 @@ def get_github_token():
     resp = requests.post(token_url, headers=headers)
     return resp.json()['token']
 
-def check_existing_branch(ticket_key):
-    """설치된 모든 리포지토리를 순회하며 브랜치 검색"""
-    print(f"🔍 [검색 시작] {ticket_key} 브랜치 찾는 중...")
+def extract_ticket_key(text):
+    if not text: return None
+    match = re.search(r'\b([A-Z]+-\d+)\b', text)
+    if match:
+        return match.group(1)
+    return None
+
+def scan_github_for_ticket(ticket_key):
+    print(f"🔍 [전체 스캔 시작] {ticket_key} 관련 브랜치/PR 찾는 중...")
     try:
         token = get_github_token()
         if not token: return
 
         headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-        
-        # 앱이 설치된 리포지토리 목록 조회
         repos_url = "https://api.github.com/installation/repositories?per_page=100"
         repo_resp = requests.get(repos_url, headers=headers)
         if repo_resp.status_code != 200: return
@@ -131,27 +147,50 @@ def check_existing_branch(ticket_key):
             repo_full_name = repo['full_name']
             repo_html_url = repo['html_url']
             
+            # 1. 브랜치 검색
             branches_url = f"https://api.github.com/repos/{repo_full_name}/branches"
             branches_resp = requests.get(branches_url, headers=headers)
-            
             if branches_resp.status_code == 200:
                 for branch in branches_resp.json():
-                    if ticket_key in branch['name']:
-                        # 찾음! DB 업데이트
+                    found_key = extract_ticket_key(branch['name'])
+                    if found_key == ticket_key:
+                        with app.app_context():
+                            ticket = Ticket.query.filter_by(key=ticket_key).first()
+                            if ticket and not ticket.branch_url and not ticket.is_merged:
+                                ticket.branch_url = f"{repo_html_url}/tree/{branch['name']}"
+                                db.session.commit()
+                                print(f"🔗 [자동 연결] 브랜치 발견: {branch['name']}")
+                                notify_frontend(ticket.key)
+
+            # 2. PR 검색
+            prs_url = f"https://api.github.com/repos/{repo_full_name}/pulls?state=all&per_page=100"
+            prs_resp = requests.get(prs_url, headers=headers)
+            if prs_resp.status_code == 200:
+                for pr in prs_resp.json():
+                    key_from_title = extract_ticket_key(pr['title'])
+                    key_from_branch = extract_ticket_key(pr['head']['ref'])
+                    
+                    if ticket_key in [key_from_title, key_from_branch]:
                         with app.app_context():
                             ticket = Ticket.query.filter_by(key=ticket_key).first()
                             if ticket:
-                                ticket.branch_url = f"{repo_html_url}/tree/{branch['name']}"
-                                # if ticket.status == "To Do": ticket.status = "In Progress"
+                                ticket.pr_url = pr['html_url']
+                                if pr.get('merged_at'):
+                                    ticket.is_merged = True
+                                    ticket.status = "Done"
+                                    ticket.branch_url = None
+                                    print(f"✅ [자동 연결] 머지된 PR 발견: {pr['title']}")
+                                else:
+                                    print(f"🔗 [자동 연결] 진행중 PR 발견: {pr['title']}")
+                                
                                 db.session.commit()
-                                print(f"🔗 [자동 연결 완료] {repo_full_name} -> {branch['name']}")
-                                notify_frontend(ticket.key, ticket.status)
-                        return # 찾으면 종료
+                                notify_frontend(ticket.key)
+                        break 
     except Exception as e:
-        print(f"⚠️ 브랜치 스캔 실패: {e}")
+        print(f"⚠️ GitHub 스캔 실패: {e}")
 
 # --- 5. API 엔드포인트 ---
-# ✨ [신규] 프로젝트 목록 조회 및 생성
+
 @app.route('/api/projects', methods=['GET', 'POST'])
 def manage_projects():
     if request.method == 'GET':
@@ -160,7 +199,6 @@ def manage_projects():
     
     if request.method == 'POST':
         data = request.json
-        # 코드는 대문자로 저장
         code = data['code'].upper()
         if Project.query.filter_by(code=code).first():
             return jsonify({"error": "이미 존재하는 프로젝트 코드입니다."}), 400
@@ -168,20 +206,18 @@ def manage_projects():
         new_project = Project(name=data['name'], code=code)
         db.session.add(new_project)
         db.session.commit()
+        
+        notify_frontend(new_project.code, "project_updated")
+        
         return jsonify(new_project.to_dict()), 201
 
-# ✨ [수정] 티켓 목록 조회 (특정 프로젝트의 티켓만 가져오기)
 @app.route('/api/tickets', methods=['GET'])
 def get_tickets():
-    project_id = request.args.get('projectId') # 쿼리 파라미터로 받음
-    if not project_id:
-        return jsonify([]) # 프로젝트 선택 안되면 빈 배열
-    
-    # 해당 프로젝트의 티켓만, 순서대로 조회
+    project_id = request.args.get('projectId')
+    if not project_id: return jsonify([])
     tickets = Ticket.query.filter_by(project_id=project_id).order_by(Ticket.order_index.asc()).all()
     return jsonify([t.to_dict() for t in tickets])
 
-# ✨ [수정] 티켓 생성 (프로젝트 코드 기반 키 생성)
 @app.route('/api/tickets', methods=['POST'])
 def create_ticket():
     data = request.json
@@ -189,33 +225,29 @@ def create_ticket():
     title = data.get('title')
 
     project = Project.query.get(project_id)
-    if not project:
-        return jsonify({"error": "Project not found"}), 404
+    if not project: return jsonify({"error": "Project not found"}), 404
 
-    # 해당 프로젝트 내에서 가장 높은 번호 찾기 (키 생성을 위해)
-    # 예: "ABC-1", "ABC-2" ... -> 현재 ABC 프로젝트에 몇 개 있는지 카운트
-    ticket_count = Ticket.query.filter_by(project_id=project_id).count()
-    next_num = ticket_count + 1
+    # ✨ [수정] 프로젝트 모델에 저장된 카운터를 증가시켜 사용 (번호 재사용 방지)
+    project.last_ticket_number += 1
+    next_num = project.last_ticket_number
+    
     ticket_key = f"{project.code}-{next_num}"
 
-    # 해당 프로젝트 내에서의 순서(order_index) 계산
-    max_order = db.session.query(db.func.max(Ticket.order_index))\
-        .filter_by(project_id=project_id).scalar() or 0
+    # 순서는 여전히 현재 티켓들 기준 맨 뒤로
+    max_order = db.session.query(func.max(Ticket.order_index)).filter_by(project_id=project_id).scalar() or 0
 
     new_ticket = Ticket(
         project_id=project.id,
         key=ticket_key, 
+        ticket_number=next_num,
         title=title, 
         order_index=max_order + 1
     )
     db.session.add(new_ticket)
     db.session.commit()
     
-    notify_frontend(new_ticket.key, new_ticket.status)
-
-    # 비동기 브랜치 검색
-    thread = threading.Thread(target=check_existing_branch, args=(ticket_key,))
-    thread.start()
+    notify_frontend(new_ticket.key)
+    threading.Thread(target=scan_github_for_ticket, args=(ticket_key,)).start()
     
     return jsonify(new_ticket.to_dict()), 201
 
@@ -224,47 +256,45 @@ def update_ticket(key):
     data = request.json
     ticket = Ticket.query.filter_by(key=key).first()
     if not ticket: return jsonify({"error": "Ticket not found"}), 404
-        
     if 'status' in data: ticket.status = data['status']
     if 'content' in data: ticket.content = data['content']
     if 'title' in data: ticket.title = data['title']
-
     db.session.commit()
-    notify_frontend(ticket.key, ticket.status)
+    notify_frontend(ticket.key)
     return jsonify(ticket.to_dict())
 
-# 3. ✨ [신규] 배치 업데이트 API (순서 변경용)
+@app.route('/api/tickets/<string:key>', methods=['DELETE'])
+def delete_ticket(key):
+    ticket = Ticket.query.filter_by(key=key).first()
+    if not ticket: return jsonify({"error": "Ticket not found"}), 404
+    try:
+        db.session.delete(ticket)
+        db.session.commit()
+        notify_frontend(key, "ticket_updated")
+        return jsonify({"message": "Deleted successfully"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/tickets/batch', methods=['PUT'])
 def update_tickets_batch():
-    """
-    프론트엔드에서 보낸 티켓 리스트(순서 및 상태 포함)대로 DB를 싹 업데이트합니다.
-    """
     tickets_data = request.json 
-    print(f"📦 [배치 업데이트 요청] {len(tickets_data)}개 데이터 수신")
-
-    changed_ticket_key = None 
-
     for item in tickets_data:
         ticket = Ticket.query.filter_by(key=item['key']).first()
         if ticket:
             ticket.status = item['status']
             ticket.order_index = item['order_index']
-            
-    try:
-        db.session.commit()
-        
-        # ✨ [추가된 부분] 변경 사항이 저장되면 모든 브라우저에 '방송'을 합니다.
-        # 프론트엔드가 'Batch Updated'라는 이벤트를 기다리고 있으므로, 그 이름으로 보냅니다.
-        msg = format_sse(json.dumps({"message": "refresh_all"}), event="Batch Updated")
-        announcer.announce(msg)
-        
-        print("✅ [DB 저장 및 알림 전송 완료]")
-        return jsonify({"message": "Batch update success"})
-        
-    except Exception as e:
-        db.session.rollback()
-        print(f"❌ [DB 저장 실패] {e}")
-        return jsonify({"error": str(e)}), 500
+    db.session.commit()
+    msg = format_sse(json.dumps({"message": "refresh_all"}), event="Batch Updated")
+    announcer.announce(msg)
+    return jsonify({"message": "Batch update success"})
+
+@app.route('/api/tickets/<string:key>/scan', methods=['POST'])
+def scan_ticket_manually(key):
+    ticket = Ticket.query.filter_by(key=key).first()
+    if not ticket: return jsonify({"error": "Ticket not found"}), 404
+    threading.Thread(target=scan_github_for_ticket, args=(key,)).start()
+    return jsonify({"message": "Scanning started..."}), 202
 
 @app.route('/stream')
 def stream():
@@ -293,57 +323,54 @@ def webhook_handler():
 
     if event_type == 'create' and payload.get('ref_type') == 'branch':
         handle_branch_creation(payload)
-    elif event_type == 'pull_request' and payload['action'] in ['opened', 'edited']:
+    elif event_type == 'pull_request':
         handle_pull_request(payload)
+    elif event_type == 'delete' and payload.get('ref_type') == 'branch':
+        handle_branch_deletion(payload)
+        
     return "OK", 200
 
 def handle_branch_creation(payload):
     branch_name = payload['ref']
     repo_html_url = payload['repository']['html_url']
-    match = re.search(r'([A-Z]+-\d+)', branch_name)
-    if match:
-        ticket_key = match.group(1)
+    ticket_key = extract_ticket_key(branch_name)
+    if ticket_key:
         with app.app_context():
             ticket = Ticket.query.filter_by(key=ticket_key).first()
             if ticket:
-                # ticket.status = "In Progress"
                 ticket.branch_url = f"{repo_html_url}/tree/{branch_name}"
                 db.session.commit()
-                notify_frontend(ticket_key, "In Progress")
+                notify_frontend(ticket_key)
+
+def handle_branch_deletion(payload):
+    branch_name = payload['ref']
+    ticket_key = extract_ticket_key(branch_name)
+    if ticket_key:
+        with app.app_context():
+            ticket = Ticket.query.filter_by(key=ticket_key).first()
+            if ticket:
+                print(f"🗑️ 브랜치 삭제됨 ({branch_name}) -> 티켓 연결 해제")
+                ticket.branch_url = None
+                db.session.commit()
+                notify_frontend(ticket_key)
 
 def handle_pull_request(payload):
+    action = payload['action']
     pr = payload['pull_request']
-    match = re.search(r'([A-Z]+-\d+)', pr['title'])
-    if match:
-        ticket_key = match.group(1)
+    ticket_key = extract_ticket_key(pr['title'])
+    if not ticket_key: ticket_key = extract_ticket_key(pr['head']['ref'])
+        
+    if ticket_key:
         with app.app_context():
             ticket = Ticket.query.filter_by(key=ticket_key).first()
             if ticket:
                 ticket.pr_url = pr['html_url']
+                if action == 'closed' and pr.get('merged') is True:
+                    ticket.is_merged = True
+                    ticket.status = "Done"
+                    ticket.branch_url = None
                 db.session.commit()
-                notify_frontend(ticket_key, ticket.status)
-
-# ✨ [신규] 티켓 삭제 API
-@app.route('/api/tickets/<string:key>', methods=['DELETE'])
-def delete_ticket(key):
-    ticket = Ticket.query.filter_by(key=key).first()
-    if not ticket:
-        return jsonify({"error": "Ticket not found"}), 404
-    
-    try:
-        db.session.delete(ticket)
-        db.session.commit()
-        
-        # 🔴 [수정 전] notify_frontend(key, "deleted") <- 프론트엔드가 'deleted' 이벤트를 안 듣고 있음
-        
-        # 🟢 [수정 후] 두 번째 인자를 비워서 기본값("ticket_updated")으로 보내거나 명시합니다.
-        notify_frontend(key, "ticket_updated") 
-        
-        return jsonify({"message": "Deleted successfully"}), 200
-        
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+                notify_frontend(ticket_key)
 
 if __name__ == '__main__':
     app.run(port=3000, debug=True, threaded=True)
