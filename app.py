@@ -46,9 +46,19 @@ class MessageAnnouncer:
 
 announcer = MessageAnnouncer()
 
-# --- 2. DB 모델 ---
+# --- 2. DB 모델 수정 ---
+class Project(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)   # 프로젝트 이름 (예: "쇼핑몰 구축")
+    code = db.Column(db.String(10), unique=True, nullable=False) # 프로젝트 코드 (예: "SHOP")
+    tickets = db.relationship('Ticket', backref='project', lazy=True)
+
+    def to_dict(self):
+        return {"id": self.id, "name": self.name, "code": self.code}
+
 class Ticket(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    project_id = db.Column(db.Integer, db.ForeignKey('project.id'), nullable=False) # ✨ 소속 프로젝트 ID
     key = db.Column(db.String(20), unique=True, nullable=False)
     title = db.Column(db.String(200), nullable=False)
     content = db.Column(db.Text, default="")
@@ -63,9 +73,10 @@ class Ticket(db.Model):
             "title": self.title,
             "content": self.content,
             "status": self.status,
-            "order_index": self.order_index, # ✨
+            "order_index": self.order_index,
             "branch_url": self.branch_url,
-            "pr_url": self.pr_url
+            "pr_url": self.pr_url,
+            "project_code": self.project.code # 프론트에서 색상 구분등에 쓸 수 있음
         }
 
 with app.app_context():
@@ -140,23 +151,63 @@ def check_existing_branch(ticket_key):
         print(f"⚠️ 브랜치 스캔 실패: {e}")
 
 # --- 5. API 엔드포인트 ---
+# ✨ [신규] 프로젝트 목록 조회 및 생성
+@app.route('/api/projects', methods=['GET', 'POST'])
+def manage_projects():
+    if request.method == 'GET':
+        projects = Project.query.all()
+        return jsonify([p.to_dict() for p in projects])
+    
+    if request.method == 'POST':
+        data = request.json
+        # 코드는 대문자로 저장
+        code = data['code'].upper()
+        if Project.query.filter_by(code=code).first():
+            return jsonify({"error": "이미 존재하는 프로젝트 코드입니다."}), 400
+            
+        new_project = Project(name=data['name'], code=code)
+        db.session.add(new_project)
+        db.session.commit()
+        return jsonify(new_project.to_dict()), 201
+
+# ✨ [수정] 티켓 목록 조회 (특정 프로젝트의 티켓만 가져오기)
 @app.route('/api/tickets', methods=['GET'])
 def get_tickets():
-    # order_index 오름차순 (0, 1, 2...)
-    tickets = Ticket.query.order_by(Ticket.order_index.asc()).all()
+    project_id = request.args.get('projectId') # 쿼리 파라미터로 받음
+    if not project_id:
+        return jsonify([]) # 프로젝트 선택 안되면 빈 배열
+    
+    # 해당 프로젝트의 티켓만, 순서대로 조회
+    tickets = Ticket.query.filter_by(project_id=project_id).order_by(Ticket.order_index.asc()).all()
     return jsonify([t.to_dict() for t in tickets])
 
+# ✨ [수정] 티켓 생성 (프로젝트 코드 기반 키 생성)
 @app.route('/api/tickets', methods=['POST'])
 def create_ticket():
     data = request.json
-    last_ticket_id = Ticket.query.order_by(Ticket.id.desc()).first()
-    next_id = 1 if not last_ticket_id else last_ticket_id.id + 1
-    ticket_key = f"MY-{next_id}" 
+    project_id = data.get('projectId')
+    title = data.get('title')
 
-    # ✨ 새 티켓은 맨 아래(가장 큰 index + 1)에 추가
-    max_order = db.session.query(db.func.max(Ticket.order_index)).scalar() or 0
+    project = Project.query.get(project_id)
+    if not project:
+        return jsonify({"error": "Project not found"}), 404
 
-    new_ticket = Ticket(key=ticket_key, title=data['title'], order_index=max_order + 1)
+    # 해당 프로젝트 내에서 가장 높은 번호 찾기 (키 생성을 위해)
+    # 예: "ABC-1", "ABC-2" ... -> 현재 ABC 프로젝트에 몇 개 있는지 카운트
+    ticket_count = Ticket.query.filter_by(project_id=project_id).count()
+    next_num = ticket_count + 1
+    ticket_key = f"{project.code}-{next_num}"
+
+    # 해당 프로젝트 내에서의 순서(order_index) 계산
+    max_order = db.session.query(db.func.max(Ticket.order_index))\
+        .filter_by(project_id=project_id).scalar() or 0
+
+    new_ticket = Ticket(
+        project_id=project.id,
+        key=ticket_key, 
+        title=title, 
+        order_index=max_order + 1
+    )
     db.session.add(new_ticket)
     db.session.commit()
     
@@ -186,28 +237,34 @@ def update_ticket(key):
 @app.route('/api/tickets/batch', methods=['PUT'])
 def update_tickets_batch():
     """
-    프론트엔드에서 보낸 티켓 리스트(순서 포함)대로 DB를 싹 업데이트합니다.
+    프론트엔드에서 보낸 티켓 리스트(순서 및 상태 포함)대로 DB를 싹 업데이트합니다.
     """
-    tickets_data = request.json # [{key: 'MY-1', status: 'To Do', order_index: 0}, ...]
+    tickets_data = request.json 
+    print(f"📦 [배치 업데이트 요청] {len(tickets_data)}개 데이터 수신")
 
-    changed_ticket_key = None # 알림용 (하나만 보냄)
+    changed_ticket_key = None 
 
     for item in tickets_data:
         ticket = Ticket.query.filter_by(key=item['key']).first()
         if ticket:
-            # 상태나 순서가 바뀌었으면 업데이트
-            if ticket.status != item['status'] or ticket.order_index != item['order_index']:
-                ticket.status = item['status']
-                ticket.order_index = item['order_index']
-                changed_ticket_key = ticket.key # 변경된 놈 기억
-
-    db.session.commit()
-
-    # 변경 사항이 있으면 방송 (단순하게 '목록 갱신해라' 신호만 줘도 됨)
-    if changed_ticket_key:
-        notify_frontend(changed_ticket_key, "Batch Updated")
-
-    return jsonify({"message": "Batch update success"})
+            ticket.status = item['status']
+            ticket.order_index = item['order_index']
+            
+    try:
+        db.session.commit()
+        
+        # ✨ [추가된 부분] 변경 사항이 저장되면 모든 브라우저에 '방송'을 합니다.
+        # 프론트엔드가 'Batch Updated'라는 이벤트를 기다리고 있으므로, 그 이름으로 보냅니다.
+        msg = format_sse(json.dumps({"message": "refresh_all"}), event="Batch Updated")
+        announcer.announce(msg)
+        
+        print("✅ [DB 저장 및 알림 전송 완료]")
+        return jsonify({"message": "Batch update success"})
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"❌ [DB 저장 실패] {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/stream')
 def stream():

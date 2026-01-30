@@ -1,116 +1,126 @@
-import React, { useState, useEffect, useRef } from 'react'; // useRef 추가
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import './App.css';
 
 function App() {
+  // --- State 관리 ---
+  const [projects, setProjects] = useState([]); 
+  const [activeProjectId, setActiveProjectId] = useState(null); 
+  
   const [tickets, setTickets] = useState([]);
   const [title, setTitle] = useState("");
   const [connectionStatus, setConnectionStatus] = useState("연결 중...");
+  
   const [selectedTicket, setSelectedTicket] = useState(null);
   const [isCopied, setIsCopied] = useState(false);
+  const [newProjectName, setNewProjectName] = useState("");
+  const [newProjectCode, setNewProjectCode] = useState("");
+  const [showProjectModal, setShowProjectModal] = useState(false);
 
-  // ✨ 드래그 중인 항목과 드래그 대상 항목을 추적하기 위한 Ref
-  const dragItem = useRef();
-  const dragOverItem = useRef();
+  // 드래그 추적 Ref
+  const draggingTicketKey = useRef(null); 
+  
+  // 드래그 중 서버 알림 무시용 플래그
+  const isDraggingRef = useRef(false);
+
+  // 데이터의 진실(Source of Truth)
+  const ticketsRef = useRef([]); 
+  const fetchTicketsRef = useRef();
 
   const COLUMNS = ["To Do", "In Progress", "Done"];
 
-  const fetchTickets = async () => {
-    try {
-      const res = await axios.get('http://localhost:8000/api/tickets');
-      setTickets(res.data);
-    } catch (err) { console.error(err); }
-  };
-
+  // --- 초기 데이터 로드 ---
   useEffect(() => {
-    fetchTickets();
-    const eventSource = new EventSource("http://localhost:8000/stream");
+    fetchProjects();
+    
+    const eventSource = new EventSource("http://localhost:3000/stream");
     eventSource.onopen = () => setConnectionStatus("🟢 실시간 연결됨");
-    eventSource.addEventListener("ticket_updated", () => fetchTickets());
+    
+    const handleUpdate = () => {
+        // 드래그 중일 땐 서버 알림 무시
+        if (isDraggingRef.current) return;
+        if (fetchTicketsRef.current) fetchTicketsRef.current(); 
+    };
+
+    eventSource.addEventListener("ticket_updated", handleUpdate);
+    eventSource.addEventListener("Batch Updated", handleUpdate);
+
     eventSource.onerror = () => eventSource.close();
     return () => eventSource.close();
   }, []);
 
-  const createTicket = async () => {
-    if (!title) return;
-    await axios.post('http://localhost:8000/api/tickets', { title });
-    setTitle("");
-    fetchTickets(); // 내 화면 즉시 갱신 (SSE 기다리지 않고)
-  };
-
-  // --- ✨ 새로운 드래그 앤 드롭 로직 ---
-
-  // 1. 드래그 시작
-  const onDragStart = (e, position) => {
-    dragItem.current = position; // { status: "To Do", index: 0 } 형태로 저장
-  };
-
-  // 2. 다른 카드 위로 드래그 시 (순서 교체)
-  const onDragEnter = (e, position) => {
-    e.preventDefault(); // 필수
-    dragOverItem.current = position;
-
-    const source = dragItem.current;
-    const destination = dragOverItem.current;
-
-    // 같은 카드가 아니면 순서 교체 로직 실행
-    if (source.index === destination.index && source.status === destination.status) return;
-
-    // React State 내에서 배열 순서를 바꿈 (화면에 즉시 반영)
-    const newTickets = [...tickets];
-
-    // 현재 상태(Status)별로 그룹화된 리스트가 아니라, 전체 리스트에서 인덱스를 찾아야 함
-    // 편의를 위해 "현재 드래그 중인 티켓 객체"를 찾습니다.
-    const draggedTicket = newTickets.find(t => t.status === source.status && newTickets.indexOf(t) === source.globalIndex);
-
-    // 하지만 위 방식은 복잡하므로, 화면에 보이는 리스트 순서를 조작하는 방식을 씁니다.
-    // 여기서는 간단하게 "티켓 리스트 전체를 재정렬" 하는 함수를 만듭니다.
-
-    // 1. 원본 복사
-    const listCopy = [...tickets];
-
-    // 2. 드래그 중인 아이템 추출
-    const draggingItemContent = listCopy[source.globalIndex];
-
-    // 3. 리스트에서 제거
-    listCopy.splice(source.globalIndex, 1);
-
-    // 4. 새 위치(목표 아이템의 위치)에 삽입
-    // 목표 위치가 다른 컬럼이라면, 상태(status)도 업데이트 해줘야 함
-    draggingItemContent.status = destination.status;
-    listCopy.splice(destination.globalIndex, 0, draggingItemContent);
-
-    // 5. Ref 업데이트 (이제 내 위치가 바뀌었으므로)
-    dragItem.current = { ...destination, globalIndex: destination.globalIndex };
-    dragOverItem.current = null; // 초기화
-
-    // 6. State 업데이트
-    setTickets(listCopy);
-  };
-
-  // 3. 드래그 종료 (서버 저장)
-  const onDragEnd = async () => {
-    // 현재 tickets 상태는 이미 순서가 바뀌어 있음
-    // 이 순서대로 order_index를 매겨서 서버에 전송
-    const updatedTickets = tickets.map((t, index) => ({
-      key: t.key,
-      status: t.status, // 드래그하면서 이미 status는 바뀌어 있음
-      order_index: index // 배열 순서대로 0, 1, 2... 부여
-    }));
-
-    try {
-      await axios.put('http://localhost:8000/api/tickets/batch', updatedTickets);
-      console.log("순서 저장 완료");
-    } catch (err) {
-      console.error("순서 저장 실패", err);
-      fetchTickets(); // 실패하면 원복
+  // 프로젝트 변경 시
+  useEffect(() => {
+    if (activeProjectId) {
+      fetchTickets(activeProjectId);
+      fetchTicketsRef.current = () => fetchTickets(activeProjectId);
+    } else {
+      setTickets([]);
+      ticketsRef.current = [];
+      fetchTicketsRef.current = null;
     }
+  }, [activeProjectId]);
 
-    dragItem.current = null;
-    dragOverItem.current = null;
+
+  // --- API 통신 ---
+  const fetchProjects = async () => {
+    try {
+      const res = await axios.get('http://localhost:3000/api/projects');
+      setProjects(res.data);
+      if (res.data.length > 0 && !activeProjectId) {
+        setActiveProjectId(res.data[0].id);
+      }
+    } catch (err) { console.error(err); }
   };
 
-  // --- 기존 함수들 (모달 등) ---
+  const createProject = async () => {
+    if (!newProjectName || !newProjectCode) return alert("이름과 코드를 입력하세요");
+    try {
+      await axios.post('http://localhost:3000/api/projects', {
+        name: newProjectName,
+        code: newProjectCode
+      });
+      setShowProjectModal(false);
+      setNewProjectName("");
+      setNewProjectCode("");
+      fetchProjects(); 
+    } catch(err) { alert(err.response?.data?.error || "생성 실패"); }
+  };
+
+  const fetchTickets = async (projectId) => {
+    if (!projectId) return;
+    try {
+      const res = await axios.get(`http://localhost:3000/api/tickets?projectId=${projectId}`);
+      setTickets(res.data);
+      ticketsRef.current = res.data;
+    } catch (err) { console.error(err); }
+  };
+
+  const createTicket = async () => {
+    if (!title || !activeProjectId) return;
+    try {
+      await axios.post('http://localhost:3000/api/tickets', { 
+          title, 
+          projectId: activeProjectId 
+      });
+      setTitle("");
+      fetchTickets(activeProjectId);
+    } catch (err) { console.error(err); }
+  };
+
+  const saveTicket = async () => {
+    if (!selectedTicket) return;
+    try {
+      await axios.put(`http://localhost:3000/api/tickets/${selectedTicket.key}`, {
+        title: selectedTicket.title,
+        content: selectedTicket.content,
+        status: selectedTicket.status
+      });
+      fetchTickets(activeProjectId);
+      setSelectedTicket(null);
+    } catch (err) { alert("저장 실패"); }
+  };
+
   const copyBranchCommand = () => {
     if (!selectedTicket) return;
     const command = `git checkout -b feature/${selectedTicket.key}`;
@@ -120,161 +130,237 @@ function App() {
     });
   };
 
-  const saveTicket = async () => {
-    if (!selectedTicket) return;
-    try {
-      await axios.put(`http://localhost:8000/api/tickets/${selectedTicket.key}`, {
-        title: selectedTicket.title,
-        content: selectedTicket.content
-      });
-      fetchTickets();
-      setSelectedTicket(null);
-    } catch (err) { alert("저장 실패"); }
+
+  // --- 🚀 드래그 앤 드롭 (수정됨: onDrop 사용) ---
+  
+  const onDragStart = (e, ticketKey) => {
+    draggingTicketKey.current = ticketKey;
+    isDraggingRef.current = true;
+    e.dataTransfer.effectAllowed = "move"; // 이동 커서 설정
   };
 
-  // 헬퍼: 티켓의 전체 리스트 내 인덱스 찾기
-  const getGlobalIndex = (key) => tickets.findIndex(t => t.key === key);
+  // 1. 카드 이동 (Swap) - 화면 갱신
+  const onDragEnterCard = (e, targetKey, targetStatus) => {
+    e.preventDefault();
+    if (!draggingTicketKey.current || draggingTicketKey.current === targetKey) return;
 
+    const listCopy = [...ticketsRef.current];
+    const dragIndex = listCopy.findIndex(t => t.key === draggingTicketKey.current);
+    const targetIndex = listCopy.findIndex(t => t.key === targetKey);
+
+    if (dragIndex === -1 || targetIndex === -1) return;
+
+    const draggedItem = listCopy[dragIndex];
+    listCopy.splice(dragIndex, 1);
+    
+    // 상태 변경 및 이동
+    const updatedItem = { ...draggedItem, status: targetStatus };
+    listCopy.splice(targetIndex, 0, updatedItem);
+
+    ticketsRef.current = listCopy;
+    setTickets(listCopy);
+  };
+
+  // 2. 컬럼 이동 (Move) - 화면 갱신
+  const onDragEnterColumn = (e, status) => {
+    e.preventDefault();
+    const currentKey = draggingTicketKey.current;
+    if (!currentKey) return;
+
+    const listCopy = [...ticketsRef.current];
+    const dragIndex = listCopy.findIndex(t => t.key === currentKey);
+    
+    if (dragIndex === -1) return;
+
+    const draggedItem = listCopy[dragIndex];
+    if (draggedItem.status === status) return; // 이미 같은 상태면 무시
+
+    listCopy.splice(dragIndex, 1);
+    
+    const updatedItem = { ...draggedItem, status: status };
+    listCopy.push(updatedItem); 
+
+    ticketsRef.current = listCopy;
+    setTickets(listCopy);
+  };
+
+  // 3. ✨ [핵심 수정] 드롭 시 DB 저장 (onDragEnd 대신 사용)
+  // 마우스 버튼을 놓는 순간 이 함수가 무조건 실행됩니다.
+  const handleDrop = async (e) => {
+    e.preventDefault(); // 기본 동작 방지 필수
+    
+    // 드래그가 끝났으므로 플래그 해제
+    isDraggingRef.current = false;
+    draggingTicketKey.current = null;
+
+    // 현재 화면에 보이는 최종 상태(Ref)를 가져옴
+    const finalTickets = ticketsRef.current;
+    
+    // 서버 전송용 데이터
+    const payload = finalTickets.map((t, index) => ({
+        key: t.key,
+        status: t.status,
+        order_index: index
+    }));
+
+    try {
+        console.log("🔥 [ON DROP] 서버로 데이터 전송 시작!", payload);
+        await axios.put('http://localhost:3000/api/tickets/batch', payload);
+        console.log("✅ [ON DROP] 저장 성공!");
+    } catch (err) {
+        console.error("❌ [ON DROP] 저장 실패", err);
+        fetchTickets(activeProjectId);
+    }
+  };
+  
+  // onDragEnd는 이제 보조 역할만 함 (혹시 모를 초기화)
+  const onDragEnd = () => {
+      isDraggingRef.current = false;
+      draggingTicketKey.current = null;
+  };
+
+
+  // --- 렌더링 ---
   return (
-    <div style={{ maxWidth: "1200px", margin: "0 auto", padding: "20px", fontFamily: "sans-serif" }}>
-      <header style={{ display: "flex", justifyContent: "space-between", marginBottom: "20px" }}>
-        <h1 style={{ margin: 0 }}>🚀 My Jira Board</h1>
-        <span style={{ fontSize: "14px", color: connectionStatus.includes("🟢") ? "green" : "red" }}>{connectionStatus}</span>
-      </header>
+    <div style={{ display: "flex", height: "100vh", fontFamily: "sans-serif", overflow: "hidden" }}>
       
-      <div style={{ display: "flex", gap: "10px", marginBottom: "30px" }}>
-        <input style={{ flex: 1, padding: "10px", fontSize: "16px" }} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="새로운 할 일 입력" onKeyDown={(e) => e.key === 'Enter' && createTicket()} />
-        <button onClick={createTicket} style={{ padding: "10px 20px", background: "#007bff", color: "white", border: "none", cursor: "pointer" }}>만들기</button>
-      </div>
-
-      <div style={{ display: "flex", gap: "20px", height: "calc(100vh - 200px)" }}>
-        {COLUMNS.map(status => {
-          // 해당 컬럼의 티켓들만 필터링
-          const columnTickets = tickets.filter(t => t.status === status);
-
-          return (
-            <div
-              key={status}
-              // 컬럼 자체에 드롭했을 때 (빈 공간) 처리 - 맨 뒤로 보내기 등은 복잡하므로
-              // 여기서는 카드 간 교체(Swap) 방식만 사용합니다.
-              onDragOver={(e) => e.preventDefault()}
-              style={{ flex: 1, background: "#f4f5f7", borderRadius: "8px", padding: "15px", display: "flex", flexDirection: "column" }}
+      {/* 사이드바 */}
+      <div style={{ width: "260px", background: "#0747A6", color: "white", padding: "20px", display:"flex", flexDirection:"column" }}>
+        <h2 style={{ fontSize: "20px", marginBottom: "30px", marginTop: 0 }}>Jira Clone</h2>
+        <div style={{ marginBottom: "10px", fontWeight: "bold", fontSize: "12px", color: "#B3D4FF" }}>PROJECTS</div>
+        <ul style={{ listStyle: "none", padding: 0, margin: 0, flex: 1, overflowY:"auto" }}>
+          {projects.map(p => (
+            <li 
+              key={p.id} 
+              onClick={() => setActiveProjectId(p.id)}
+              style={{ 
+                padding: "10px", cursor: "pointer", borderRadius: "4px", marginBottom: "5px",
+                background: activeProjectId === p.id ? "rgba(255,255,255,0.2)" : "transparent",
+                fontWeight: activeProjectId === p.id ? "bold" : "normal",
+                display: "flex", alignItems: "center", gap: "8px"
+              }}
             >
-              <h3 style={{ margin: "0 0 15px 0", color: "#5e6c84", fontSize: "14px", textTransform: "uppercase" }}>
-                {status} <span style={{background:"#dfe1e6", borderRadius:"10px", padding:"2px 8px", fontSize:"12px"}}>{columnTickets.length}</span>
-              </h3>
-
-              <div style={{ overflowY: "auto", flex: 1, minHeight: "100px" }}>
-                {columnTickets.map((t, index) => (
-                  <div
-                    key={t.key}
-                    draggable
-                    // ✨ 드래그 시작 시: 현재 상태, 컬럼 내 인덱스, 전체 리스트 인덱스를 저장
-                    onDragStart={(e) => onDragStart(e, { status, index, globalIndex: getGlobalIndex(t.key) })}
-                    // ✨ 다른 카드 위로 올라왔을 때: 순서 교체 시도
-                    onDragEnter={(e) => onDragEnter(e, { status, index, globalIndex: getGlobalIndex(t.key) })}
-                    // ✨ 드래그 끝났을 때: 서버 저장
-                    onDragEnd={onDragEnd}
-                    // 클릭 이벤트
-                    onClick={() => setSelectedTicket(t)}
-
-                    style={{
-                      background: "white", padding: "15px", borderRadius: "4px", marginBottom: "10px",
-                      boxShadow: "0 1px 2px rgba(0,0,0,0.1)", cursor: "grab",
-                      borderLeft: t.status === "In Progress" ? "4px solid #0052cc" : t.status === "Done" ? "4px solid #00875a" : "4px solid #42526e"
-                    }}
-                  >
-                    <div style={{ fontSize: "12px", color: "#6b778c", marginBottom: "8px", display:"flex", justifyContent:"space-between" }}>
-                      <strong>{t.key}</strong>
-                      {t.branch_url && <span style={{color:"green", fontWeight:"bold"}}>🌱 연결됨</span>}
-                    </div>
-                    <div style={{ fontSize: "16px", fontWeight: "bold", color: "#333" }}>{t.title}</div>
-                  </div>
-                ))}
-
-                {/* 빈 공간 처리: 컬럼에 티켓이 하나도 없거나, 맨 아래로 옮기고 싶을 때를 위한 투명 영역 */}
-                {/* 빈 공간 처리: 컬럼에 티켓이 하나도 없거나, 맨 아래로 옮기고 싶을 때 */}
-                <div 
-                  style={{ height: "100%", flex: 1, minHeight: "50px" }} // minHeight 추가하여 빈 컬럼도 드롭 영역 확보
-                  onDragEnter={(e) => {
-                    e.preventDefault();
-
-                    // 1. 드래그 중인 아이템이 없으면 무시
-                    if (!dragItem.current) return;
-
-                    const source = dragItem.current;
-                    const targetStatus = status; // 현재 마우스가 올라온 컬럼의 상태
-
-                    // 2. 이미 같은 컬럼에 있다면 무시 (카드끼리 순서 변경은 위의 카드 onDragEnter에서 처리함)
-                    if (source.status === targetStatus) return;
-
-                    // 3. 다른 컬럼으로 이동 로직 실행
-                    const newTickets = [...tickets];
-                    const draggingItemContent = newTickets[source.globalIndex];
-
-                    // (1) 원래 위치에서 삭제
-                    newTickets.splice(source.globalIndex, 1);
-
-                    // (2) 상태 변경
-                    draggingItemContent.status = targetStatus;
-
-                    // (3) 리스트 맨 끝에 추가 (빈 컬럼이거나 맨 아래 빈 공간이므로)
-                    newTickets.push(draggingItemContent);
-
-                    // (4) Ref 업데이트 (중요: 현재 드래그 중인 아이템의 위치가 바뀌었음을 알림)
-                    dragItem.current = {
-                      ...source,
-                      status: targetStatus,
-                      globalIndex: newTickets.length - 1
-                    };
-
-                    // (5) 화면 갱신
-                    setTickets(newTickets);
-                  }}
-                ></div>
-              </div>
-            </div>
-          )
-        })}
+              <span style={{background:"#dfe1e6", color:"#172b4d", padding:"2px 6px", borderRadius:"3px", fontSize:"11px", fontWeight:"bold", minWidth:"30px", textAlign:"center"}}>{p.code}</span>
+              <span>{p.name}</span>
+            </li>
+          ))}
+        </ul>
+        <button onClick={() => setShowProjectModal(true)} style={{ padding: "12px", background: "rgba(255,255,255,0.2)", color: "white", border: "none", borderRadius: "4px", cursor: "pointer", marginTop: "10px", fontWeight:"bold" }}>+ 새 프로젝트 만들기</button>
       </div>
 
-      {/* 모달 (기존 코드 유지) */}
-      {selectedTicket && (
-        <div style={{ position: "fixed", top: 0, left: 0, width: "100%", height: "100%", backgroundColor: "rgba(0,0,0,0.5)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 1000 }} onClick={() => setSelectedTicket(null)}>
-          <div style={{ background: "white", width: "600px", padding: "30px", borderRadius: "8px", boxShadow: "0 4px 12px rgba(0,0,0,0.15)", position: "relative" }} onClick={(e) => e.stopPropagation()}>
-            <div style={{ marginBottom: "20px", borderBottom: "1px solid #eee", paddingBottom: "10px" }}>
-              <span style={{ fontSize: "14px", color: "#5e6c84", fontWeight: "bold" }}>{selectedTicket.key}</span>
-              <input type="text" value={selectedTicket.title} onChange={(e) => setSelectedTicket({...selectedTicket, title: e.target.value})} style={{ width: "100%", fontSize: "24px", fontWeight: "bold", border: "none", outline: "none", marginTop: "5px" }} />
+      {/* 메인 보드 */}
+      <div style={{ flex: 1, padding: "20px", background: "#fff", overflowY: "auto", display: "flex", flexDirection: "column" }}>
+        <header style={{ display: "flex", justifyContent: "space-between", marginBottom: "20px", alignItems:"center" }}>
+          <div>
+            <h1 style={{ margin: "0 0 5px 0", fontSize: "24px" }}>
+               {projects.find(p => p.id === activeProjectId)?.name || "프로젝트를 선택하세요"}
+            </h1>
+            <span style={{ fontSize: "14px", color: "#6b778c" }}>
+               {projects.find(p => p.id === activeProjectId) ? `${projects.find(p => p.id === activeProjectId).code} 보드` : ""}
+            </span>
+          </div>
+          <span style={{ fontSize: "14px", fontWeight: "bold", color: connectionStatus.includes("🟢") ? "green" : "red" }}>{connectionStatus}</span>
+        </header>
+
+        {activeProjectId ? (
+          <>
+            <div style={{ display: "flex", gap: "10px", marginBottom: "30px" }}>
+                <input style={{ flex: 1, padding: "12px", fontSize: "16px", border: "1px solid #dfe1e6", borderRadius: "4px", outline:"none" }} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="이 프로젝트에 할 일을 추가하고 Enter..." onKeyDown={(e) => e.key === 'Enter' && createTicket()} />
+                <button onClick={createTicket} style={{ padding: "0 20px", background: "#0052cc", color: "white", border: "none", borderRadius: "4px", cursor: "pointer", fontWeight: "bold" }}>만들기</button>
             </div>
-            <div style={{ background: "#f0f8ff", padding: "15px", borderRadius: "6px", marginBottom: "20px" }}>
-              {selectedTicket.branch_url ? (
-                <div>
-                  <div style={{fontSize: "12px", color: "#5e6c84", marginBottom: "4px"}}>GitHub Branch</div>
-                  <a href={selectedTicket.branch_url} target="_blank" rel="noreferrer" style={{ color: "#0052cc", fontWeight: "bold", textDecoration: "none", display: "flex", alignItems: "center", gap: "5px" }}>🌱 {selectedTicket.branch_url.split('/').pop()} 바로가기 ↗</a>
-                </div>
-              ) : (
-                <div style={{ color: "#666", fontSize: "14px" }}>
-                  <div style={{marginBottom: "5px"}}>⚠️ 연결된 브랜치가 없습니다.</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: "10px", background: "white", padding: "8px", borderRadius: "4px", border: "1px solid #ddd" }}>
-                    <code style={{ fontFamily: "monospace", color: "#d63384", flex: 1 }}>git checkout -b feature/{selectedTicket.key}</code>
-                    <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
-                      {isCopied && <span style={{ fontSize: "12px", color: "green", fontWeight: "bold" }}>✅ Copied!</span>}
-                      <button onClick={copyBranchCommand} style={{ fontSize: "12px", padding: "4px 8px", cursor: "pointer", background: "#eee", border: "1px solid #ccc", borderRadius: "4px" }} title="명령어 복사">📋 복사</button>
+
+            <div style={{ display: "flex", gap: "20px", flex: 1 }}>
+                {COLUMNS.map(status => {
+                const columnTickets = tickets.filter(t => t.status === status);
+                return (
+                    <div
+                        key={status}
+                        // ✨ [중요] 컬럼 전체에 onDrop 이벤트 연결
+                        onDragOver={(e) => e.preventDefault()} // 이게 있어야 onDrop이 작동함
+                        onDragEnter={(e) => onDragEnterColumn(e, status)}
+                        onDrop={handleDrop} // ✨ 여기서 저장 함수 호출
+                        style={{ flex: 1, background: "#f4f5f7", borderRadius: "8px", padding: "15px", display: "flex", flexDirection: "column", minHeight: "200px" }}
+                    >
+                        <h3 style={{ margin: "0 0 15px 0", color: "#5e6c84", fontSize: "12px", textTransform: "uppercase", fontWeight: "bold" }}>
+                            {status} <span style={{background:"#dfe1e6", borderRadius:"10px", padding:"2px 8px", fontSize:"11px", marginLeft: "5px"}}>{columnTickets.length}</span>
+                        </h3>
+                        
+                        <div style={{ overflowY: "auto", flex: 1, display:"flex", flexDirection:"column" }}>
+                            {columnTickets.map((t) => (
+                            <div
+                                key={t.key}
+                                draggable
+                                onDragStart={(e) => onDragStart(e, t.key)}
+                                onDragEnter={(e) => onDragEnterCard(e, t.key, status)}
+                                onDragEnd={onDragEnd} // 얘는 보조
+                                onClick={() => setSelectedTicket(t)}
+                                style={{
+                                    background: "white", padding: "15px", borderRadius: "4px", marginBottom: "8px",
+                                    boxShadow: "0 1px 2px rgba(0,0,0,0.1)", cursor: "grab",
+                                    borderLeft: t.status === "In Progress" ? "4px solid #0052cc" : t.status === "Done" ? "4px solid #00875a" : "4px solid #42526e",
+                                    transition: "background 0.2s"
+                                }}
+                            >
+                                <div style={{ fontSize: "12px", color: "#6b778c", marginBottom: "8px", display:"flex", justifyContent:"space-between" }}>
+                                    <strong>{t.key}</strong>
+                                    {t.branch_url && <span style={{color:"green", fontWeight:"bold"}}>🌱</span>}
+                                </div>
+                                <div style={{ fontSize: "15px", color: "#172b4d" }}>{t.title}</div>
+                            </div>
+                            ))}
+                            <div style={{ flex: 1, minHeight: "50px" }}></div>
+                        </div>
                     </div>
-                  </div>
+                )
+                })}
+            </div>
+          </>
+        ) : (
+            <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:"100%", color:"#6b778c" }}>
+                <div style={{fontSize:"60px", marginBottom:"20px"}}>👈</div>
+                <h2 style={{margin:0}}>프로젝트를 선택해주세요</h2>
+            </div>
+        )}
+      </div>
+
+      {/* 모달 */}
+      {showProjectModal && (
+        <div style={{ position: "fixed", top: 0, left: 0, width: "100%", height: "100%", backgroundColor: "rgba(0,0,0,0.5)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 1000 }} onClick={() => setShowProjectModal(false)}>
+            <div style={{ background: "white", width: "400px", padding: "30px", borderRadius: "8px" }} onClick={(e) => e.stopPropagation()}>
+                <h3 style={{ marginTop: 0 }}>새 프로젝트 만들기</h3>
+                <input type="text" placeholder="이름" value={newProjectName} onChange={(e) => setNewProjectName(e.target.value)} style={{ width: "100%", padding: "10px", marginBottom: "10px" }} />
+                <input type="text" placeholder="코드 (KEY)" value={newProjectCode} onChange={(e) => setNewProjectCode(e.target.value)} style={{ width: "100%", padding: "10px", marginBottom: "20px" }} />
+                <button onClick={createProject} style={{ width:"100%", padding: "10px", background: "#0052cc", color: "white", border: "none", borderRadius: "4px" }}>생성하기</button>
+            </div>
+        </div>
+      )}
+
+      {selectedTicket && (
+          <div style={{ position: "fixed", top: 0, left: 0, width: "100%", height: "100%", backgroundColor: "rgba(0,0,0,0.5)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 1000 }} onClick={() => setSelectedTicket(null)}>
+            <div style={{ background: "white", width: "600px", padding: "30px", borderRadius: "8px" }} onClick={(e) => e.stopPropagation()}>
+                <div style={{display:"flex", alignItems:"center", gap:"10px", marginBottom:"20px"}}>
+                     <div style={{fontSize:"18px", fontWeight:"bold"}}>{selectedTicket.key}</div>
+                     <span style={{fontSize:"12px", background:"#dfe1e6", padding:"2px 6px", borderRadius:"4px"}}>{selectedTicket.status}</span>
                 </div>
-              )}
-            </div>
-            <div style={{ marginBottom: "20px" }}>
-              <div style={{fontSize: "12px", color: "#5e6c84", marginBottom: "5px", fontWeight: "bold"}}>Description</div>
-              <textarea value={selectedTicket.content || ""} onChange={(e) => setSelectedTicket({...selectedTicket, content: e.target.value})} style={{ width: "100%", height: "150px", padding: "10px", borderRadius: "4px", border: "1px solid #dfe1e6", resize: "none", fontSize: "14px" }} placeholder="티켓 내용을 입력하세요..." />
-            </div>
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: "10px" }}>
-              <button onClick={() => setSelectedTicket(null)} style={{ padding: "8px 16px", background: "none", border: "none", cursor: "pointer", color: "#42526e" }}>취소</button>
-              <button onClick={saveTicket} style={{ padding: "8px 16px", background: "#0052cc", color: "white", border: "none", borderRadius: "4px", cursor: "pointer", fontWeight: "bold" }}>저장하기</button>
+                
+                <input type="text" value={selectedTicket.title} onChange={(e) => setSelectedTicket({...selectedTicket, title: e.target.value})} style={{ width: "100%", fontSize: "20px", marginBottom:"20px", padding:"5px" }} />
+                <textarea value={selectedTicket.content || ""} onChange={(e) => setSelectedTicket({...selectedTicket, content: e.target.value})} style={{ width: "100%", height: "150px", marginBottom:"20px", padding:"10px" }} />
+                
+                {selectedTicket.branch_url ? (
+                     <a href={selectedTicket.branch_url} target="_blank" rel="noreferrer" style={{display:"block", marginBottom:"20px", color:"green"}}>🌱 브랜치 바로가기</a>
+                ) : (
+                    <div style={{background:"#f4f5f7", padding:"10px", marginBottom:"20px", borderRadius:"4px"}}>
+                        <code>git checkout -b feature/{selectedTicket.key}</code>
+                        <button onClick={copyBranchCommand} style={{marginLeft:"10px"}}>복사</button>
+                        {isCopied && <span style={{marginLeft:"5px", color:"green"}}>V</span>}
+                    </div>
+                )}
+
+                <div style={{textAlign:"right"}}>
+                    <button onClick={saveTicket} style={{ padding: "8px 20px", background: "#0052cc", color: "white", border: "none", borderRadius: "4px" }}>저장</button>
+                </div>
             </div>
           </div>
-        </div>
       )}
     </div>
   );
