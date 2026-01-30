@@ -323,5 +323,27 @@ def handle_pull_request(payload):
                 db.session.commit()
                 notify_frontend(ticket_key, ticket.status)
 
+# ✨ [신규] 티켓 삭제 API
+@app.route('/api/tickets/<string:key>', methods=['DELETE'])
+def delete_ticket(key):
+    ticket = Ticket.query.filter_by(key=key).first()
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+    
+    try:
+        db.session.delete(ticket)
+        db.session.commit()
+        
+        # 🔴 [수정 전] notify_frontend(key, "deleted") <- 프론트엔드가 'deleted' 이벤트를 안 듣고 있음
+        
+        # 🟢 [수정 후] 두 번째 인자를 비워서 기본값("ticket_updated")으로 보내거나 명시합니다.
+        notify_frontend(key, "ticket_updated") 
+        
+        return jsonify({"message": "Deleted successfully"}), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     app.run(port=3000, debug=True, threaded=True)
